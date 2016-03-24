@@ -1,25 +1,30 @@
-import time
+from __future__ import print_function
 
+import time
+import numpy as np
+import astropy.units as u
 from glue.core.client import Client
 from glue.core import message as msg
+from ..core.utils import MaskExtractor
 
-from specview.core import SpectrumData, SpectrumArray
-from cube_tools.core import SpectrumData as NewSpectrumData
-import astropy.units as u
-from glue.plugins.tools.spectrum_tool import Extractor
-
-import numpy as np
+from ..core.data_objects import SpectrumData, CubeData
 
 
 class SpectraClient(Client):
     def __init__(self, data=None, model=None, graph=None):
         super(SpectraClient, self).__init__(data)
+        self._time = time.time()
+        self._update_queue = []
+        self._data = data
         self.graph = graph
         self.model = model
-        self.artists = {}
-        self.spec_data_item = None
+        self._subsets = []
+        self._artists = {}
+        self._data_dict = {}
         self.main_data = None
         self.current_item = None
+        self._node_parent = self.model.create_cube_data_item(None, name='Node')
+        print("New spectra client has been created.")
 
     def unregister(self, hub):
         super(SpectraClient, self).unregister(hub)
@@ -36,101 +41,113 @@ class SpectraClient(Client):
         print("Updating data")
 
     def _update_subset(self, message):
-        print("Updating subset")
         subset = message.sender
 
-        tstart = time.time()
-        mask = subset.to_mask()
+        if subset.data not in self._subsets or subset.data.ndim != 3:
+            return
 
-        tstart = time.time()
-        data = subset.data['flux']
-        mdata = np.ma.array(data, mask=~mask)
+        # TODO: Getting multiple update messages for the same data... it's
+        # causing noticible lag on generating spectra. Currently, check to
+        # make sure not too many update attempts are coming at once. Yes,
+        # I know a list is unnecessary here.
+        if time.time() - self._time < 1:
+            if subset not in self._update_queue:
+                self._update_queue.append(subset)
+            return
 
-        clp_data = np.nanmean(np.nanmean(mdata, axis=1), axis=1)
+        if self._update_queue:
+            subset = self._update_queue.pop()
+            self._update_queue = []
 
-        if subset in self.artists:
-            layer_data_item = self.artists[subset]
-            layer_data_item.update_data(clp_data)
+        self._time = time.time()
+
+        print("Updating subset")
+        cube_data = subset.data['cube']
+        filter_mask_cube = MaskExtractor.subset_mask(subset, 'cube',
+                                                     (0, 'y', 'x'), 0)
+
+        # filter_mask_cube = subset.to_mask()
+        # mask = np.invert(mask)
+        print("Finished creating mask")
+
+        if subset in self._artists:
+            layer_data_item = self._artists[subset]
+            layer_data_item.update_data(filter_mask=filter_mask_cube)
 
             self.update_graph(layer_data_item)
         else:
-            self.artists[subset] = self.add_layer(data=clp_data,
-                                                  name="{} ({})".format(
-                                                      subset.label,
-                                                      subset.data.label))
+            self._artists[subset] = self.add_layer(
+                parent=self._data_dict[cube_data],
+                filter_mask=filter_mask_cube,
+                name="{} ({})".format(subset.label, subset.data.label),
+                color=subset.color)
 
     def _add_subset(self, message):
-        print("Adding subset")
         subset = message.sender
+        if 'cube' in [x.label for x in subset.data.components] \
+                and subset not in self._subsets:
+            self._subsets.append(subset.data)
 
-    def add_layer(self, data=None, mask=None, name='Layer', set_active=True,
-                  style='line'):
+    def add_data(self, data, label="Cube Data"):
+        # Create data and layer items
+        if len(data.shape) == 3:
+            data_item = self.model.create_cube_data_item(data)
+        else:
+            print("Created spec data item")
+            data_item = self.model.create_spec_data_item(data)
+
+        self._data_dict[data] = data_item
+
+        layer_data_item = self.add_layer(parent=data_item,
+                                         name=label,
+                                         set_active=True,
+                                         style='line')
+
+        return layer_data_item
+
+    def add_layer(self, parent, filter_mask=None, collapse='mean',
+                  name='Layer', set_active=True, style='line', color=None):
         print("Adding layer {}".format(name))
-        layer_data_item = self.model.create_layer_item(self.spec_data_item,
-                                                       raw_data=data,
-                                                       mask=mask,
+
+        layer_data_item = self.model.create_layer_item(parent,
+                                                       node_parent=self._node_parent,
+                                                       filter_mask=filter_mask,
+                                                       collapse=collapse,
                                                        name=name)
 
         self.graph.add_item(layer_data_item, style=style,
-                            set_active=set_active)
+                            pen=None if color is None else {'color': color})
 
         return layer_data_item
 
     def register_to_hub(self, hub):
         super(SpectraClient, self).register_to_hub(hub)
+        self._hub = hub
         dfilter = lambda x: self.data
         dcfilter = lambda x: self.data
-        subfilter = lambda x: self.data
+        subfilter = lambda x: x.subset in self._artists.keys()
 
         hub.subscribe(self,
                       msg.SubsetCreateMessage,
-                      handler=self._add_subset,
-                      filter=dfilter)
+                      handler=self._add_subset)
         hub.subscribe(self,
                       msg.SubsetUpdateMessage,
-                      handler=self._update_subset,
-                      filter=subfilter)
+                      handler=self._update_subset)
         hub.subscribe(self,
                       msg.SubsetDeleteMessage,
                       handler=self._remove_subset)
         hub.subscribe(self,
                       msg.DataUpdateMessage,
-                      handler=self._update_data,
-                      filter=dfilter)
+                      handler=self._update_data)
         hub.subscribe(self,
                       msg.DataCollectionDeleteMessage,
                       handler=self._remove_data)
         hub.subscribe(self,
                       msg.NumericalDataChangedMessage,
                       handler=self._numerical_data_changed)
-        # hub.subscribe(self,
-        #               msg.ComponentReplacedMessage,
-        #               handler=self._on_component_replaced)
 
     def data(self):
         return super(SpectraClient, self).data()
-
-    def add_data(self, data):
-        flux_comp = data.get_component(data.id['flux'])
-        self.main_data = flux_comp.data
-        disp_comp = data.get_component(data.id['disp'])
-        uncert_comp = data.get_component(data.id['uncertainty'])
-        mask_comp = data.get_component(data.id['mask'])
-        wcs_comp = data.get_component(data.id['header'])
-
-        flux_sum = np.nanmean(np.nanmean(flux_comp.data, axis=1), axis=1)
-
-        spectrum = SpectrumData()
-        spectrum.set_x(disp_comp.data[:, 0, 0], unit=u.Unit(disp_comp.units))
-        spectrum.set_y(flux_sum, unit=u.Unit(flux_comp.units))
-
-        # Create data and layer items
-        self.spec_data_item = self.model.create_data_item(spectrum, "Data")
-
-        layer_data_item = self.add_layer(name=data.label,
-                                         set_active=True, style='line')
-
-        return layer_data_item
 
     def _numerical_data_changed(self, message):
         pass
@@ -139,15 +156,21 @@ class SpectraClient(Client):
         print("Apply roi")
 
     def _remove_subset(self, message):
+        print("Removing subsets")
         subset = message.sender
+        if subset in self._subsets:
+            self._subsets.remove(subset)
 
-        if subset in self.artists:
-            layer_data_item = self.artists[subset]
-            self.graph.remove_item(self.artists[message.sender])
+        if subset in self._artists:
+            layer_data_item = self._artists[subset]
+            self.graph.remove_item(layer_data_item)
             index = self.model.indexFromItem(layer_data_item)
             parent_index = self.model.indexFromItem(layer_data_item.parent)
+            node_parent_index = self.model.indexFromItem(
+                layer_data_item.node_parent)
             self.model.remove_data_item(index, parent_index)
-            del self.artists[message.sender]
+            self.model.remove_data_item(index, node_parent_index)
+            del self._artists[subset]
 
     def update_graph(self, layer_data_item):
         self.graph.update_item(layer_data_item)
