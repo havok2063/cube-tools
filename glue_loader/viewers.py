@@ -75,3 +75,5 @@ def draw(axes, data, red_center, blue_center, green_center, red_width, blue_widt
     axes.set_xlabel('RA')
     axes.set_ylabel('DEC')
     # axes.set_title(data.label)
+
+

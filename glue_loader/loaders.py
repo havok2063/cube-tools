@@ -1,4 +1,5 @@
 from __future__ import print_function
+from __future__ import division
 
 from os.path import basename
 from collections import defaultdict
@@ -29,8 +30,8 @@ def _load_fits_generic(filename, **kwargs):
                 try:
                     data = groups[shape]
                 except KeyError:
-                    label = '{}[{}]'.format(
-                        label_base,
+                    label = '{0}[{1}][{2}]'.format(
+                        label_base, hdu_name,
                         'x'.join(str(x) for x in shape)
                     )
                     data = Data(label=label)
@@ -41,25 +42,27 @@ def _load_fits_generic(filename, **kwargs):
             elif is_table_hdu(hdu):
                 # Loop through columns and make component list
                 table = Table(hdu.data)
-                table_name = '{}[{}]'.format(
+                table_name = '{0}[{1}]'.format(
                     label_base,
                     hdu_name
                 )
                 for column_name in table.columns:
                     column = table[column_name]
                     shape = column.shape
-                    data_label = '{}[{}]'.format(
-                        table_name,
-                        'x'.join(str(x) for x in shape)
-                    )
+                    data_label = '{0}[{1}]'.format(table_name,shape[0])
                     try:
                         data = groups[data_label]
                     except KeyError:
                         data = Data(label=data_label)
                         groups[data_label] = data
-                    component = Component.autotyped(column, units=column.unit)
-                    data.add_component(component=component,
-                                       label=column_name)
+                    #component = Component.autotyped(column, units=column.unit)
+                    if len(shape) > 1:
+                        for colid,col in enumerate(column.transpose()):
+                            component = Component(col,units=column.unit)
+                            data.add_component(component=component,label='{0}_{1}'.format(column_name,colid+1))
+                    else:
+                        component = Component(column, units=column.unit)
+                        data.add_component(component=component, label=column_name)
     return [data for data in groups.itervalues()]
 
 
